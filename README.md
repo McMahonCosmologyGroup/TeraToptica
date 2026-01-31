@@ -1,1 +1,3 @@
 A python analysis and plotting package for reflection and transmission data collected using Toptica Photonic's TeraScan and TeraFlash spectrometer instruments. The authors of this code are not affiliated with Toptica Photonics.
+
+This project is licensed under the terms of the MIT license.

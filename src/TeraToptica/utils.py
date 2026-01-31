@@ -103,9 +103,6 @@ def get_open_current(self):
 def get_sample_current(self):
     return self.samp_freq, self.samp_amp
 
-def get_norm_factor(self):
-    return self.C
-
 def get_mask(self):
     return self.mask
 

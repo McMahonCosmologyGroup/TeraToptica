@@ -1,4 +1,4 @@
-# src/terapy/tf.py
+# src/TeraToptica/tf.py
 
 from __future__ import annotations
 
@@ -402,6 +402,7 @@ class TeraFlashAnalyzer:
 
 TeraFlashAnalyzer.get_spectra = _utils.get_spectra
 TeraFlashAnalyzer.get_smoothed_spectra = _utils.get_smoothed_spectra
-TeraFlashAnalyzer.get_open_current = _utils.get_open_current
 TeraFlashAnalyzer.get_sample_current = _utils.get_sample_current
+TeraFlashAnalyzer.get_base_current = _utils.get_base_current
+TeraFlashAnalyzer.get_open_current = _utils.get_open_current
 TeraFlashAnalyzer.get_mask = _utils.get_mask

@@ -97,11 +97,14 @@ def get_smoothed_spectra(self):
         self.boxnum,
     )
 
-def get_open_current(self):
+def get_base_current(self):
     return self.base_freq, self.base_amp
 
 def get_sample_current(self):
     return self.samp_freq, self.samp_amp
+
+def get_open_current(self):
+    return self.open_freq, self.open_amp
 
 def get_mask(self):
     return self.mask

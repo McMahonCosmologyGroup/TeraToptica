@@ -402,6 +402,7 @@ class TeraScanAnalyzer:
 # Attach legacy-style getters from utils for backwards compatibility
 TeraScanAnalyzer.get_spectra = _utils.get_spectra
 TeraScanAnalyzer.get_smoothed_spectra = _utils.get_smoothed_spectra
-TeraScanAnalyzer.get_open_current = _utils.get_open_current
 TeraScanAnalyzer.get_sample_current = _utils.get_sample_current
+TeraScanAnalyzer.get_base_current = _utils.get_base_current
+TeraScanAnalyzer.get_open_current = _utils.get_open_current
 TeraScanAnalyzer.get_mask = _utils.get_mask

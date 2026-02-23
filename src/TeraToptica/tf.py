@@ -244,17 +244,17 @@ class TeraFlashAnalyzer:
 
         self.boxnum = compute_boxnum_from_window_size(self.base_freq, self.config.window_size)
 
-        bcbase = convolve_1d(self.base_amp, self.boxnum, window=self.config.window)
-        bcsamp = convolve_1d(self.samp_amp, self.boxnum, window=self.config.window)
+        self.bcbase = convolve_1d(self.base_amp, self.boxnum, window=self.config.window)
+        self.bcsamp = convolve_1d(self.samp_amp, self.boxnum, window=self.config.window)
 
         if self.config.open_stem is None:
-            self.normed = (bcsamp / bcbase) ** 2
+            self.normed = (self.bcsamp / self.bcbase) ** 2
         else:
-            bcopen = convolve_1d(self.open_amp, self.boxnum, window=self.config.window)
-            self.normed = ((bcsamp - bcopen) / (bcbase - bcopen)) ** 2
+            self.bcopen = convolve_1d(self.open_amp, self.boxnum, window=self.config.window)
+            self.normed = ((self.bcsamp - self.bcopen) / (self.bcbase - self.bcopen)) ** 2
 
         # 4) Errors
-        smoothing_err = rolling_std_error(self.normed_unsmoothed, self.boxnum)
+        self.smoothing_err = rolling_std_error(self.normed_unsmoothed, self.boxnum)
 
         if self.config.include_mes_err:
             # noise estimate in high-frequency region
@@ -265,23 +265,23 @@ class TeraFlashAnalyzer:
                 raise ValueError("No frequency points found above noise_floor_min_ghz for noise estimation.")
             
             if self.config.open_stem is None:
-                mes_err = 2*bcsamp*noise_amp/(bcbase**2)*np.sqrt(1+(bcsamp/bcbase)**2)
+                self.mes_err = 2*self.bcsamp*noise_amp/(self.bcbase**2)*np.sqrt(1+(self.bcsamp/self.bcbase)**2)
             else:
                 # Define R = N / D = (S-O)/(B-O)
-                D = (bcbase - bcopen)
-                N = (bcsamp - bcopen)
+                D = (self.bcbase - self.bcopen)
+                N = (self.bcsamp - self.bcopen)
                 R = N / D
 
                 dR_dS = 1.0 / D
                 dR_dB = -R / D
-                dR_dO = (bcsamp - bcbase) / (D**2)
+                dR_dO = (self.bcsamp - self.bcbase) / (D**2)
 
                 var_R = (noise_amp**2) * (dR_dS**2 + dR_dB**2 + dR_dO**2)
-                mes_err = 2.0 * np.abs(R) * np.sqrt(var_R)
+                self.mes_err = 2.0 * np.abs(R) * np.sqrt(var_R)
         
-            self.err = np.sqrt(smoothing_err**2 + mes_err**2)
+            self.err = np.sqrt(self.smoothing_err**2 + self.mes_err**2)
         else:
-            self.err = smoothing_err
+            self.err = self.smoothing_err
 
     # ----------------------------
     # I/O helpers (internal)

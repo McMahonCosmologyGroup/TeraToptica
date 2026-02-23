@@ -171,36 +171,39 @@ class TeraScanAnalyzer:
 
         # 2) Choose a common frequency grid (use base as reference)
         #    and interpolate sample/open/phase if needed.
-        if (len(self.samp_freq) != len(self.base_freq)) or (not np.allclose(self.samp_freq, self.base_freq)):            
-            if self.config.fiber_stretcher:
-                amp = interp1d(self.samp_freq, self.samp_amp, bounds_error=False, fill_value="extrapolate")
-                ph  = interp1d(self.samp_freq, self.samp_phase, bounds_error=False, fill_value='extrapolate')
-                pc  = interp1d(self.samp_freq, self.samp_pc, bounds_error=False, fill_value='extrapolate')
+        samp_diff = (len(self.samp_freq) != len(self.base_freq)) or (not np.allclose(self.samp_freq, self.base_freq, atol=0.1))
+        open_diff = (
+                    self.config.open_stem is not None and 
+                    ((len(self.open_freq) != len(self.base_freq)) or (not np.allclose(self.open_freq, self.base_freq, atol=0.1)))
+                )
 
-                self.samp_amp   = amp(self.base_freq)
-                self.samp_pc    = pc(self.base_freq)
-                self.samp_phase = ph(self.base_freq)
-            else:
-                pc = interp1d(self.samp_freq, self.samp_pc, bounds_error=False, fill_value="extrapolate")
-                self.samp_pc    = pc(self.base_freq)
+        if samp_diff or open_diff:
+            # cut frequencies to measured overlap (sample [+ open])
+            fmin, fmax = np.min(self.samp_freq), np.max(self.samp_freq)
+            if self.config.open_stem is not None: 
+                fmin, fmax = max(fmin, np.min(self.open_freq)), min(fmax, np.max(self.open_freq))
 
-            self.samp_freq = self.base_freq.copy()
-            print(f"Warning: file {self.samp} had mismatched lengths or values. Interpolated to match reference and discarding raw sample frequencies.")
+            m = (self.base_freq >= fmin) & (self.base_freq <= fmax)
+            if not np.any(m):
+                raise ValueError("No overlapping frequency range between base and measured data.")
 
-        if self.config.open_stem is not None:
-            if (len(self.open_freq) != len(self.base_freq)) or (not np.allclose(self.open_freq, self.base_freq)):
+            self.base_freq = self.base_freq[m]
+            
+            if samp_diff:
                 if self.config.fiber_stretcher:
-                    amp = interp1d(self.open_freq, self.open_amp, bounds_error=False, fill_value='extrapolate')
-                    ph  = interp1d(self.open_freq, self.open_phase, bounds_error=False, fill_value='extrapolate')
-                    pc  = interp1d(self.open_freq, self.open_pc, bounds_error=False, fill_value='extrapolate')
+                    self.samp_amp   = interp1d(self.samp_freq, self.samp_amp,   bounds_error=True)(self.base_freq)
+                    self.samp_phase = interp1d(self.samp_freq, self.samp_phase, bounds_error=True)(self.base_freq)
 
-                    self.open_amp   = amp(self.base_freq)
-                    self.open_pc    = pc(self.base_freq)
-                    self.open_phase = ph(self.base_freq)
-                else:
-                    pc = interp1d(self.open_freq, self.open_pc, bounds_error=False, fill_value="extrapolate")
-                    self.open_pc    = pc(self.base_freq)
+                self.samp_pc   = interp1d(self.samp_freq, self.samp_pc, bounds_error=True)(self.base_freq)
+                self.samp_freq = self.base_freq.copy()
+                print(f"Warning: file {self.samp} had mismatched lengths or values. Interpolated to match reference and discarding raw sample frequencies.")
+        
+            if open_diff:
+                if self.config.fiber_stretcher:
+                    self.open_amp   = interp1d(self.open_freq, self.open_amp, bounds_error=True)(self.base_freq)
+                    self.open_phase = interp1d(self.open_freq, self.open_phase, bounds_error=True)(self.base_freq)
 
+                self.open_pc = interp1d(self.open_freq, self.open_pc, bounds_error=True)
                 self.open_freq = self.base_freq.copy()
                 print(f"Warning: file {self.config.open_stem} had mismatched lengths or values. Interpolated to match reference and discarding raw open frequencies.")
 

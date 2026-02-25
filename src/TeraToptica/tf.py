@@ -28,6 +28,8 @@ class FFTConfig:
     """
 
     dfreq: float | None = None  # GHz
+    tmin_ps: float | None = None  # optional relative time-domain cut start (ps)
+    tmax_ps: float | None = None  # optional relative time-domain cut end (ps)
     rel_start: float = 0.01
     rel_end: float = 0.01
     fft_norm: Literal["ortho"] | None = "ortho"
@@ -154,6 +156,27 @@ class TeraFlashAnalyzer:
                 raise ValueError(f"Unsupported layout: {self.config.layout} Layout must be 'separate_files' or 'reference_included'.")
 
         else:
+            if (self.config.fft.tmin_ps is not None) or (self.config.fft.tmax_ps is not None):
+                tmin = self.config.fft.tmin_ps+np.min(self.samp_time) if self.config.fft.tmin_ps is not None else np.min(self.samp_time)
+                tmax = self.config.fft.tmax_ps+np.min(self.samp_time) if self.config.fft.tmax_ps is not None else np.max(self.samp_time)
+                
+                samp_mask = (self.samp_time >= tmin) & (self.samp_time <= tmax)
+                base_mask = (self.base_time >= tmin) & (self.base_time <= tmax)
+
+                if samp_mask.sum() < 2 or base_mask.sum() < 2:
+                    raise ValueError("Time cut results in fewer than 2 samples for FFT; adjust tmin_ps and tmax_ps in the FFTConfig.")
+
+                self.samp_time = self.samp_time[samp_mask]
+                self.samp_signal = self.samp_signal[samp_mask]
+
+                self.base_time = self.base_time[base_mask]
+                self.base_signal = self.base_signal[base_mask]
+
+                if self.config.open_stem is not None:
+                    open_mask = (self.open_time >= tmin) & (self.open_time <= tmax)
+                    self.open_time = self.open_time[open_mask]
+                    self.open_signal = self.open_signal[open_mask]
+
             self.samp_freq, self.samp_amp, self.samp_phase = self._spectr_from_pulse(
                 self.samp_time,
                 self.samp_signal,

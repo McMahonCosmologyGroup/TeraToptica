@@ -11,5 +11,6 @@ setup(
         "scipy",
         "matplotlib",
         "astropy",
+        "numba",
     ],
 )

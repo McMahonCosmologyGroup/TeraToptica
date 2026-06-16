@@ -310,6 +310,16 @@ class TeraScanAnalyzer:
         # Your legacy code used skiprows=1 and tab separation.
         return np.loadtxt(path, skiprows=1, delimiter="\t")
 
+    def _require_col(self, header: list[str], target: str) -> int:
+        """Return the index of *target* in *header*, or raise a descriptive ValueError."""
+        try:
+            return header.index(target)
+        except ValueError:
+            raise ValueError(
+                f"Required column {target!r} not found in file header.\n"
+                f"Available columns: {header}"
+            ) from None
+
     def _select_columns(self, header: list[str]):
         """Select required columns based on `fiber_stretcher`.
 
@@ -320,22 +330,29 @@ class TeraScanAnalyzer:
         If fiber_stretcher=False:
             (freq_col, pc_col)
 
-        This is intentionally strict: missing or unexpected headers should raise.
+        Raises ValueError for any missing required column.
         """
 
-        # Frequency: always prefer actual frequency
+        # Frequency: prefer actual frequency, fall back to set frequency.
+        # Raise only if neither is present.
         if self.config.header_freq_act in header:
             freq_col = header.index(self.config.header_freq_act)
-        else:
+        elif self.config.header_freq_set in header:
             freq_col = header.index(self.config.header_freq_set)
+        else:
+            raise ValueError(
+                f"No frequency column found. Expected one of: "
+                f"{self.config.header_freq_act!r} or {self.config.header_freq_set!r}.\n"
+                f"Available columns: {header}"
+            )
 
         if self.config.fiber_stretcher:
-            amp_col = header.index(self.config.header_amp)
-            phase_col = header.index(self.config.header_phase)
+            amp_col = self._require_col(header, self.config.header_amp)
+            phase_col = self._require_col(header, self.config.header_phase)
             return freq_col, amp_col, phase_col
 
-        pc_col = header.index(self.config.header_pc)
-        return (freq_col, pc_col)
+        pc_col = self._require_col(header, self.config.header_pc)
+        return freq_col, pc_col
 
     @staticmethod
     def _fourier_cut(
@@ -396,7 +413,7 @@ class TeraScanAnalyzer:
         """
         return self.samp_amp, self.base_amp
 
-    def get_phase(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_phases(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (sample_phase, base_phase).
         If fiber_stretcher=True and phase column exists, phase is read from file.
         If fiber_stretcher=False, phase is derived from the analytic Hilbert signal.

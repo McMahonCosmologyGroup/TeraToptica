@@ -8,6 +8,9 @@ from typing import Literal, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy.signal import find_peaks, peak_widths
+from scipy.interpolate import interp1d
+from scipy.ndimage import median_filter, maximum_filter1d
 
 from . import utils as _utils
 from .utils import (
@@ -47,6 +50,13 @@ class TeraFlashConfig:
     window_size: float = 15.0
     mask_bounds: Optional[Sequence[Tuple[float, float]]] = None
     include_mes_err: bool = True
+
+    # If True, find and smooth over atmospheric dips
+    atm_correction: bool = False
+    atm_threshold: float = 0.2  # fractional depth below local envelope to flag as a atm dip
+    atm_envelope_window_ghz: float = 150.0  # rolling-max envelope window for atm dip finding
+    atm_prominence_db: float = 2.0  # min peak prominence (dB) for the shape check
+    atm_max_width_ghz: float = 300.0  # max peak width (GHz) for the shape check
 
     # how to interpret TF5 export format
     layout: Literal["separate_files", "reference_included"] = "separate_files"
@@ -256,6 +266,47 @@ class TeraFlashAnalyzer:
 
         self.mask = build_mask_from_bounds(self.base_freq, self.config.mask_bounds)
 
+        if self.config.atm_correction:
+            base_flags = self.find_atm_mask(
+                self.base_freq, self.base_amp,
+                threshold=self.config.atm_threshold,
+                envelope_window_ghz=self.config.atm_envelope_window_ghz,
+                prominence_db=self.config.atm_prominence_db,
+                max_width_ghz=self.config.atm_max_width_ghz,
+            )
+            samp_flags = self.find_atm_mask(
+                self.samp_freq, self.samp_amp,
+                threshold=self.config.atm_threshold,
+                envelope_window_ghz=self.config.atm_envelope_window_ghz,
+                prominence_db=self.config.atm_prominence_db,
+                max_width_ghz=self.config.atm_max_width_ghz,
+            )
+
+            # A dip flagged in only one channel must still be corrected in
+            # BOTH: each channel's mask is found independently, so they can
+            # disagree at a given frequency (noise trips one channel's shape
+            # check but not the other's). Correcting only the flagged channel
+            # then leaves the other raw at that exact frequency -- dividing a
+            # corrected value by a raw one (or vice versa) fabricates a new
+            # ratio spike/dip that was never in the raw data. Union the two
+            # masks *before* filling (not after), so each channel's fill is
+            # computed against the same shared mask rather than its own,
+            # possibly narrower one.
+            self.atm_mask = base_flags | samp_flags
+            self.samp_atm_mask = self.atm_mask
+
+            self.atm_envelope = self.fill_dips(
+                self.base_freq, self.base_amp, self.atm_mask,
+                envelope_window_ghz=self.config.atm_envelope_window_ghz,
+            )
+            self.samp_atm_envelope = self.fill_dips(
+                self.samp_freq, self.samp_amp, self.samp_atm_mask,
+                envelope_window_ghz=self.config.atm_envelope_window_ghz,
+            )
+
+            self.base_amp[self.atm_mask] = self.atm_envelope[self.atm_mask]
+            self.samp_amp[self.samp_atm_mask] = self.samp_atm_envelope[self.samp_atm_mask]
+
         # 3) Spectra (unsmoothed + smoothed)
 
         if self.config.open_stem is None:
@@ -330,7 +381,126 @@ class TeraFlashAnalyzer:
         ).T
         m = ~np.isnan(t)
         return t[m], sig[m]
-    
+
+
+    # ----------------------------
+    # Atmospheric dip detection and interpolating
+    # ----------------------------
+
+    @staticmethod
+    def _depth_mask(freq: np.ndarray, amp: np.ndarray, threshold: float, envelope_window_ghz: float):
+        """Rolling-max envelope + fractional-depth threshold. See find_atm_mask."""
+        df = np.median(np.diff(freq))
+        win = max(int(round(envelope_window_ghz / df)), 3)
+        if win % 2 == 0:
+            win += 1
+        envelope = maximum_filter1d(amp, size=win, mode="nearest")
+        envelope = np.where(envelope > 0, envelope, np.nan)
+        depth = 1.0 - amp / envelope
+        depth = np.nan_to_num(depth, nan=1.0)
+        return depth > threshold, envelope, win
+
+    @staticmethod
+    def _shape_mask(freq: np.ndarray, amp: np.ndarray, prominence_db: float, max_width_ghz: float, rel_height: float = 0.6):
+        """
+        Peak-finder-based dip shape check: atmospheric dips are sudden photocurrent drops
+        followed by an immediate rise. Runs scipy.signal.find_peaks on
+        -10*log10(amp) with a prominence floor (in dB) and a width cap (in GHz),
+        so real features (fringes, harmonic passbands, filter cutoffs) are excluded.
+        """
+        df = np.median(np.diff(freq))
+        neg_db = -10 * np.log10(np.maximum(amp, 1e-300))
+        max_width_samples = max_width_ghz / df
+        peaks, _ = find_peaks(neg_db, prominence=prominence_db, width=(0, max_width_samples))
+        mask = np.zeros_like(amp, dtype=bool)
+        if len(peaks) == 0:
+            return mask
+        _, _, left_ips, right_ips = peak_widths(neg_db, peaks, rel_height=rel_height)
+        for l, r in zip(left_ips, right_ips):
+            lo, hi = int(np.floor(l)), int(np.ceil(r)) + 1
+            mask[max(lo, 0):min(hi, len(mask))] = True
+        return mask
+
+    @staticmethod
+    def find_atm_mask(
+        freq: np.ndarray,
+        amp: np.ndarray,
+        threshold: float = 0.2,
+        envelope_window_ghz: float = 150.0,
+        prominence_db: float = 2.0,
+        max_width_ghz: float = 300.0,
+    ) -> np.ndarray:
+        """
+        Data-driven line/dip finder combining two independent checks, both must
+        agree for a bin to be flagged:
+
+        1. Depth: `amp` drops more than `threshold` (fractional) below a rolling-max
+        envelope over `envelope_window_ghz`
+        2. Shape: >=2 dB prominent, narrower than 300 GHz i.e. *sudden drop, sudden rise*). 
+        Requiring both matters: depth alone would also flag broad, gradual real features 
+        (interference fringes, harmonic passbands) The shape check structurally protects these real features.
+
+        This only detects -- see fill_dips() for computing replacement values.
+        Detection and filling are deliberately separate: when correcting two
+        channels (e.g. sample and reference) that must agree on *where* a dip is
+        (see tf.py's dip_correction, which unions each channel's independently
+        detected mask before filling either), filling must happen after that
+        union, using each channel's own data at the shared mask -- not each
+        channel's own, possibly narrower, mask.
+
+        Returns a boolean mask, same shape as `amp`.
+        """
+        depth_mask, envelope, win = TeraFlashAnalyzer._depth_mask(freq, amp, threshold, envelope_window_ghz)
+        shape_mask = TeraFlashAnalyzer._shape_mask(freq, amp, prominence_db, max_width_ghz)
+        return depth_mask & shape_mask
+
+    @staticmethod
+    def fill_dips(
+        freq: np.ndarray,
+        amp: np.ndarray,
+        mask: np.ndarray,
+        envelope_window_ghz: float = 150.0,
+    ) -> np.ndarray:
+        """
+        Compute replacement values for the bins flagged in `mask` (see
+        find_atm_mask). Filling is two steps. First, bracket-interpolate log(amp) between
+        the nearest unflagged ("good") neighbors on either side of every flagged
+        point, giving an unbiased but locally noisy curve (in a dense cluster of
+        many nearby lines, "good" data survives only in narrow, scattered islands,
+        so which two points happen to bracket a given gap -- and therefore the
+        interpolated value -- can jump around). Second, that interpolated curve is
+        passed through a rolling *median* (robust to the flagged points still
+        mixed in, unlike a mean) over `envelope_window_ghz`, which damps that
+        jumpiness without reintroducing the max's upward bias.
+
+        Returns `fill`, same shape as `amp`. `fill` equals `amp` at every point
+        except where interpolation was possible; the caller applies it as
+        `amp[mask] = fill[mask]`. Flagged points with no good data on one side
+        (e.g. at the edge of the measured range) are left as measured.
+        """
+        df = np.median(np.diff(freq))
+        win = max(int(round(envelope_window_ghz / df)), 3)
+        if win % 2 == 0:
+            win += 1
+
+        fill = amp.copy()
+        good = ~mask
+        if np.any(mask) and np.any(good):
+            log_interp = interp1d(
+                freq[good], np.log(np.maximum(amp[good], 1e-300)),
+                kind="linear", bounds_error=False, fill_value=np.nan,
+            )
+            interp_vals = log_interp(freq)
+            fillable = np.isfinite(interp_vals)
+
+            log_curve = np.where(fillable, interp_vals, np.log(np.maximum(amp, 1e-300)))
+            log_curve_smooth = median_filter(log_curve, size=win, mode="nearest")
+
+            mask_fillable = mask & fillable
+            fill[mask_fillable] = np.exp(log_curve_smooth[mask_fillable])
+
+        return fill
+        
     # ----------------------------
     # FFT helper (LabVIEW-like)
     # ----------------------------

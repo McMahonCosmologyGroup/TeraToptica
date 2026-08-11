@@ -21,7 +21,6 @@ def build_mask_from_bounds(
             mask |= (freq >= start) & (freq <= stop)
     return mask
 
-
 def compute_boxnum_from_window_size(freq: np.ndarray, window_size_ghz: float) -> int:
     """
     Convert a window size in GHz into an odd integer box length based on freq sampling.

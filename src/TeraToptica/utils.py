@@ -48,17 +48,24 @@ def convolve_1d(arr: np.ndarray, boxnum: int, *, window: WindowType = "boxcar") 
         # Median filter is not a convolution
         return median_filter(arr, size=boxnum, mode="nearest")
 
-    else: 
+    if window == "gaussian":
+        # Gaussian1DKernel's parameter is the standard deviation, not the
+        # full width, unlike every other window here. We therefore convert
+        # boxnum to an equivalent standard deviation: FWHM = 2*sqrt(2*ln2)*stddev.
+        stddev = boxnum / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        kernel = Gaussian1DKernel(stddev)
+    else:
         kernel_map = {
             "boxcar": Box1DKernel(boxnum),
-            "gaussian": Gaussian1DKernel(boxnum),
             # astropy.convolve can accept an ndarray kernel too
             "bartlett": np.bartlett(boxnum),
             "blackman": np.blackman(boxnum),
             "hanning": np.hanning(boxnum),
             "hamming": np.hamming(boxnum),
         }
-        return convolve(arr, kernel_map[window])
+        kernel = kernel_map[window]
+
+    return convolve(arr, kernel)
 
 
 def rolling_std_error(arr: np.ndarray, boxnum: int) -> np.ndarray:

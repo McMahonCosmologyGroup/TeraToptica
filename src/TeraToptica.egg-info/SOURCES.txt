@@ -1,6 +1,12 @@
+LICENSE
 README.md
 pyproject.toml
 setup.py
+src/TeraToptica/__init__.py
+src/TeraToptica/setup.py
+src/TeraToptica/tf.py
+src/TeraToptica/ts.py
+src/TeraToptica/utils.py
 src/TeraToptica.egg-info/PKG-INFO
 src/TeraToptica.egg-info/SOURCES.txt
 src/TeraToptica.egg-info/dependency_links.txt

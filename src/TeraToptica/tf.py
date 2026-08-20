@@ -43,7 +43,7 @@ class TeraFlashConfig:
     Configuration for TF5 reflection/transmission reduction.
 
     window is the smoothing window type.
-    window_size is in GHz (as in your original code).
+    window_size is in GHz. It is converted to an equivalent standard deviation for 'gaussian'
     mask_bounds are frequency ranges (GHz) to mask, e.g. [(557, 560), ...].
     """
     window: Literal["boxcar", "bartlett", "blackman", "gaussian", "hanning", "hamming", "median"] = "boxcar"

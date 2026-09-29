@@ -420,6 +420,7 @@ class TeraScanAnalyzer:
         """
         return self.samp_phase, self.base_phase
 
+
 # Attach legacy-style getters from utils for backwards compatibility
 TeraScanAnalyzer.get_spectra = _utils.get_spectra
 TeraScanAnalyzer.get_smoothed_spectra = _utils.get_smoothed_spectra
@@ -427,3 +428,4 @@ TeraScanAnalyzer.get_sample_current = _utils.get_sample_current
 TeraScanAnalyzer.get_base_current = _utils.get_base_current
 TeraScanAnalyzer.get_open_current = _utils.get_open_current
 TeraScanAnalyzer.get_mask = _utils.get_mask
+TeraScanAnalyzer.get_phase_diff = _utils.get_phase_diff

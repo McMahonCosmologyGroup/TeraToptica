@@ -57,6 +57,55 @@ class TeraFlashConfig:
     atm_envelope_window_ghz: float = 150.0  # rolling-max envelope window for atm dip finding
     atm_prominence_db: float = 2.0  # min peak prominence (dB) for the shape check
     atm_max_width_ghz: float = 300.0  # max peak width (GHz) for the shape check
+    # Detection only ever runs on the reference/base beam, never the sample
+    # beam -- see _analyze_data's atm_correction block. The sample beam has
+    # a real filter in its path, so a real, narrow, low-transmission
+    # feature there (destructive-interference notch, genuine passband
+    # ripple) looks exactly like what this depth+shape dip-finder is built
+    # to find, but isn't atmospheric at all -- the reference beam, with no
+    # filter, structurally cannot show a filter-specific feature, so only
+    # genuinely common-mode phenomena (atmosphere, the source's own
+    # emission structure) ever show up there. Detecting on the sample beam
+    # too (an earlier version of this unioned independent detectors on both
+    # channels) was tried and measurably wrong: on real ASO data, the
+    # sample-only detector flagged thousands of points as "dips" at
+    # legitimate 40-94% transmission that the reference detector didn't
+    # -- real data, not atmosphere, misclassified purely from sample-channel
+    # noise/shape with nothing in the reference beam corroborating it.
+    #
+    # A rolling-max envelope has no concept of absolute signal level -- deep
+    # in a real stopband (or any region genuinely near the noise floor),
+    # local point-to-point noise still satisfies a purely *relative* depth
+    # threshold almost everywhere, since there's no true underlying line
+    # shape left to anchor against. Skip detection wherever the reference
+    # beam's local envelope has fallen within this multiple of its own
+    # noise floor (same recipe as noise_floor_min_ghz/mes_err below: mean
+    # amplitude above noise_floor_min_ghz). This is deliberately an SNR
+    # multiple, not a fraction of the channel's own peak: the reference
+    # beam's amplitude naturally rolls off with frequency (source
+    # spectrum), so being a small fraction of its own peak does NOT mean
+    # there's no real signal left -- it can sit orders of magnitude above
+    # the noise floor at 3000 GHz while only being a percent of its own
+    # ~300 GHz peak. Gating on a peak-fraction basis was tried and
+    # incorrectly suppressed correction of real, known atmospheric lines at
+    # higher frequencies, where the peak-relative fraction has dropped low
+    # even though absolute SNR is still fine.
+    # 0 disables the gate.
+    atm_min_snr: float = 3.0
+    # Rather than trust the automatic detector's judgment everywhere, only
+    # ever apply it within (or touching) the caller's own hand-picked
+    # mask_bounds regions -- i.e. atm_correction becomes a smoothing/fill
+    # refinement of frequencies already flagged by domain knowledge, not an
+    # independent line-finder over the full spectrum. This is the safest
+    # setting for a caller with real, already-curated mask_bounds and a
+    # low tolerance for false positives outside them; it does mean atm_correction
+    # can no longer catch a real line that mask_bounds doesn't already
+    # cover. False (default) leaves detection unrestricted, matching every
+    # other atm_ gate above (which target *why* a false positive happens,
+    # not *where* detection is allowed to run) -- deliberately not the
+    # default, since it trades away real detection value outside
+    # mask_bounds for callers who don't need that trade.
+    atm_restrict_to_mask_bounds: bool = False
 
     # how to interpret TF5 export format
     layout: Literal["separate_files", "reference_included"] = "separate_files"
@@ -267,32 +316,57 @@ class TeraFlashAnalyzer:
         self.mask = build_mask_from_bounds(self.base_freq, self.config.mask_bounds)
 
         if self.config.atm_correction:
+            # Detect on a smoothed proxy, not the raw per-sample amplitude:
+            # at low averaging counts, point-to-point measurement noise
+            # alone can exceed atm_threshold/atm_prominence_db, so
+            # find_atm_mask on raw data over-triggers almost everywhere
+            # (measured: ~50-100% of a clean, dip-free spectral region
+            # flagged at 100 averages, vs ~0% at 1000 averages with the
+            # same thresholds on the same instrument -- an SNR-dependent
+            # false-positive rate, not something threshold values alone
+            # can fix robustly across averaging counts). Smoothing with
+            # the class's own window/window_size -- the same kernel
+            # already used for the reported "smoothed spectra" -- damps
+            # that per-bin noise before detection, while real atmospheric
+            # lines (see mask_bounds in practice: tens to hundreds of GHz
+            # wide) survive a `window_size`-scale smoothing intact. Filling
+            # still applies to the raw arrays below -- only detection runs
+            # on the smoothed proxy.
+            boxnum = compute_boxnum_from_window_size(self.base_freq, self.config.window_size)
+            base_amp_smooth = convolve_1d(self.base_amp, boxnum, window=self.config.window)
+
+            # Base's own noise-floor estimate (same recipe as the mes_err
+            # noise_amp below: mean amplitude above noise_floor_min_ghz, a
+            # region assumed to carry no real signal). Falls back to
+            # disabling the gate (0) if base never reaches
+            # noise_floor_min_ghz, rather than crashing -- unlike the
+            # mes_err path below, a missing estimate here just means "don't
+            # gate," not "can't compute a requested error."
+            base_min_envelope_abs = 0.0
+            if self.config.atm_min_snr > 0:
+                base_hf = self.base_freq > self.config.noise_floor_min_ghz
+                if np.any(base_hf):
+                    base_min_envelope_abs = self.config.atm_min_snr * np.average(self.base_amp[base_hf])
+
+            # Detection runs on the reference/base beam only -- see
+            # atm_min_snr's docstring in TeraFlashConfig for why the sample
+            # beam isn't independently consulted at all. Filling still
+            # applies to BOTH base_amp and samp_amp at whatever points base
+            # flags: leaving samp_amp raw at a point where base_amp was
+            # corrected would still fabricate a fake ratio spike/dip that
+            # was never in the raw data, even though only one detector ran.
             base_flags = self.find_atm_mask(
-                self.base_freq, self.base_amp,
+                self.base_freq, base_amp_smooth,
                 threshold=self.config.atm_threshold,
                 envelope_window_ghz=self.config.atm_envelope_window_ghz,
                 prominence_db=self.config.atm_prominence_db,
                 max_width_ghz=self.config.atm_max_width_ghz,
-            )
-            samp_flags = self.find_atm_mask(
-                self.samp_freq, self.samp_amp,
-                threshold=self.config.atm_threshold,
-                envelope_window_ghz=self.config.atm_envelope_window_ghz,
-                prominence_db=self.config.atm_prominence_db,
-                max_width_ghz=self.config.atm_max_width_ghz,
+                min_envelope_abs=base_min_envelope_abs,
             )
 
-            # A dip flagged in only one channel must still be corrected in
-            # BOTH: each channel's mask is found independently, so they can
-            # disagree at a given frequency (noise trips one channel's shape
-            # check but not the other's). Correcting only the flagged channel
-            # then leaves the other raw at that exact frequency -- dividing a
-            # corrected value by a raw one (or vice versa) fabricates a new
-            # ratio spike/dip that was never in the raw data. Union the two
-            # masks *before* filling (not after), so each channel's fill is
-            # computed against the same shared mask rather than its own,
-            # possibly narrower one.
-            self.atm_mask = base_flags | samp_flags
+            self.atm_mask = base_flags
+            if self.config.atm_restrict_to_mask_bounds:
+                self.atm_mask &= self.mask
             self.samp_atm_mask = self.atm_mask
 
             self.atm_envelope = self.fill_dips(
@@ -388,17 +462,52 @@ class TeraFlashAnalyzer:
     # ----------------------------
 
     @staticmethod
-    def _depth_mask(freq: np.ndarray, amp: np.ndarray, threshold: float, envelope_window_ghz: float):
-        """Rolling-max envelope + fractional-depth threshold. See find_atm_mask."""
+    def _depth_mask(freq: np.ndarray, amp: np.ndarray, threshold: float, envelope_window_ghz: float, min_envelope_abs: float | np.ndarray = 0.0):
+        """Rolling-max envelope + fractional-depth threshold. See find_atm_mask.
+
+        `min_envelope_abs` gates out any point whose *local* envelope has
+        itself fallen below this absolute amplitude -- i.e. we're already at
+        or near the noise floor with no real baseline left to measure a
+        "dip" against, not narrowly below a genuine nearby high value. This
+        is an absolute value (typically a small multiple of a noise-floor
+        estimate), deliberately not a fraction of this channel's own peak --
+        a channel's amplitude naturally rolls off with frequency (source
+        spectrum or a real filter passband), so being a small fraction of
+        its own peak doesn't mean there's no real signal left. May be a
+        scalar or a per-point array (e.g. a fraction of a *different*
+        channel's envelope). 0 (scalar) disables the gate.
+        """
         df = np.median(np.diff(freq))
         win = max(int(round(envelope_window_ghz / df)), 3)
         if win % 2 == 0:
             win += 1
-        envelope = maximum_filter1d(amp, size=win, mode="nearest")
+        half = win // 2
+
+        # A genuine narrow dip has real, comparably high values on BOTH
+        # sides within reach -- but a point on the gradual approach to a
+        # single real broad feature (a filter's own cutoff, or an
+        # interference fringe peak) only has a high reference on ONE side
+        # (the direction of that feature); the other side sits at its own
+        # already-low local level. A single *bidirectional* rolling max
+        # can't tell these apart -- it "bleeds" the one real high value
+        # from whichever side has it across the whole window, making the
+        # approach to any real peak look like a deep two-sided dip. Taking
+        # the min of two one-sided maxes (trailing-only, leading-only, each
+        # still spanning the full envelope_window_ghz so a genuinely wide
+        # dip's edges are still reached) requires a comparably high
+        # reference on BOTH sides, which only a real narrow-ish dip
+        # provides.
+        envelope_back = maximum_filter1d(amp, size=win, origin=half, mode="nearest")
+        envelope_fwd = maximum_filter1d(amp, size=win, origin=-half, mode="nearest")
+        envelope = np.minimum(envelope_back, envelope_fwd)
         envelope = np.where(envelope > 0, envelope, np.nan)
         depth = 1.0 - amp / envelope
         depth = np.nan_to_num(depth, nan=1.0)
-        return depth > threshold, envelope, win
+        mask = depth > threshold
+        min_envelope_abs = np.asarray(min_envelope_abs)
+        if np.any(min_envelope_abs > 0):
+            mask &= np.nan_to_num(envelope, nan=0.0) >= min_envelope_abs
+        return mask, envelope, win
 
     @staticmethod
     def _shape_mask(freq: np.ndarray, amp: np.ndarray, prominence_db: float, max_width_ghz: float, rel_height: float = 0.6):
@@ -429,6 +538,8 @@ class TeraFlashAnalyzer:
         envelope_window_ghz: float = 150.0,
         prominence_db: float = 2.0,
         max_width_ghz: float = 300.0,
+        min_envelope_abs: float | np.ndarray = 0.0,
+        return_envelope: bool = False,
     ) -> np.ndarray:
         """
         Data-driven line/dip finder combining two independent checks, both must
@@ -441,18 +552,23 @@ class TeraFlashAnalyzer:
         (interference fringes, harmonic passbands) The shape check structurally protects these real features.
 
         This only detects -- see fill_dips() for computing replacement values.
-        Detection and filling are deliberately separate: when correcting two
-        channels (e.g. sample and reference) that must agree on *where* a dip is
-        (see tf.py's dip_correction, which unions each channel's independently
-        detected mask before filling either), filling must happen after that
-        union, using each channel's own data at the shared mask -- not each
-        channel's own, possibly narrower, mask.
+        Detection and filling are deliberately separate: _analyze_data detects
+        on the reference/base beam only (see atm_min_snr in TeraFlashConfig for
+        why the sample beam isn't consulted), then fills BOTH channels at that
+        one shared mask, each from its own data, so the sample/reference ratio
+        never mixes a corrected value with a raw one.
 
-        Returns a boolean mask, same shape as `amp`.
+        Returns a boolean mask, same shape as `amp` -- or, if `return_envelope`,
+        `(mask, envelope)`, where `envelope` is the rolling-max envelope
+        computed in the depth check (useful as a reference for gating a
+        second, related channel, e.g. sample relative to reference).
         """
-        depth_mask, envelope, win = TeraFlashAnalyzer._depth_mask(freq, amp, threshold, envelope_window_ghz)
+        depth_mask, envelope, win = TeraFlashAnalyzer._depth_mask(freq, amp, threshold, envelope_window_ghz, min_envelope_abs)
         shape_mask = TeraFlashAnalyzer._shape_mask(freq, amp, prominence_db, max_width_ghz)
-        return depth_mask & shape_mask
+        mask = depth_mask & shape_mask
+        if return_envelope:
+            return mask, envelope
+        return mask
 
     @staticmethod
     def fill_dips(

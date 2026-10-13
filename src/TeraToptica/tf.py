@@ -685,7 +685,9 @@ class TeraFlashAnalyzer:
         freq = 1000.0 * np.fft.rfftfreq(len(x), dt)
         X = np.fft.rfft(x, norm=norm)
         amp = np.abs(X)
-        phase = np.unwrap(np.angle(X))
+        # numpy's rfft uses e^{-i w t}, so a pulse delayed by t0 has phase -w t0. The TF5 .spectr export uses
+        # e^{+i w t} (phase +w t0); negate so phase_diff, and the n it gives, have the same sign in both modes
+        phase = -np.unwrap(np.angle(X))
         return freq, amp, phase
     
     # ----------------------------

@@ -130,7 +130,7 @@ class TeraFlashAnalyzer:
     Notes
     -----
     Internal variable name uses `samp`; public methods use `sample`.
-    Implementing dynamic column selection based on header rows is coming soon.
+    Columns are read by position in the TF5 export layout (see `layout`).
     """
 
     def __init__(
@@ -701,7 +701,7 @@ class TeraFlashAnalyzer:
         return self.samp_time, self.samp_signal
 
     def get_pulse_delay(self) -> float:
-        """Sample-minus-reference pulse delay in ps (|signal| peaks, parabolically refined).
+        """Sample-minus-reference pulse delay in ps (abs(signal) peaks, parabolically refined).
 
         This is the delay get_phase_diff's default 'pulse' branch pick uses. For a sample
         of thickness w, the group index is n_g = 1 + c * delay / w.

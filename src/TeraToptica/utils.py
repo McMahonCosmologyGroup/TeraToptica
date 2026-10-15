@@ -167,12 +167,12 @@ def _pick_branch_offset(
     return offsets[i], float(intercept), i in (0, len(offsets) - 1)
 
 def _pulse_peak_time(t: np.ndarray, s: np.ndarray) -> float:
-    """Time (ps) of a pulse's |signal| peak, refined with a 3-point parabolic fit.
+    """Time (ps) of a pulse's abs(signal) peak, refined with a 3-point parabolic fit.
 
-    The median baseline is removed first so a DC offset can't move the peak. |signal|
+    The median baseline is removed first so a DC offset can't move the peak. abs(signal)
     rather than the Hilbert envelope or a cross-correlation: on lossy, reshaped pulses
     (mm-thick meteorite slabs) the envelope drifted ~0.5 ps and cross-correlation locked
-    onto the wrong lobe (off by ~3 ps), while the |signal| peak matched the phase-derived
+    onto the wrong lobe (off by ~3 ps), while the abs(signal) peak matched the phase-derived
     index to within ~0.01 in n.
     """
     t = np.asarray(t, dtype=float)
@@ -186,7 +186,7 @@ def _pulse_peak_time(t: np.ndarray, s: np.ndarray) -> float:
     return float(t[i])
 
 def _pulse_delay_ps(t_s: np.ndarray, s_s: np.ndarray, t_b: np.ndarray, s_b: np.ndarray) -> float:
-    """Sample-minus-reference pulse delay (ps) from the |signal| peak of each pulse.
+    """Sample-minus-reference pulse delay (ps) from the abs(signal) peak of each pulse.
 
     Uses each file's absolute time axis, so a reference recorded in its own file (or with
     a different time window) is handled the same as a reference_included layout.
@@ -259,6 +259,60 @@ def _orient_by_delay(
     c_plus, c_minus = coh(1.0), coh(-1.0)
     s = -1.0 if c_minus > c_plus + min_margin else 1.0
     return s, c_plus, c_minus
+
+def _reunwrap_about_delay(
+    freq: np.ndarray,
+    phase_diff: np.ndarray,
+    tau_ps: float,
+    check: np.ndarray,
+):
+    """Unwrap `phase_diff` relative to the pulse-delay model 2*pi*f*tau instead of bin by bin.
+
+    A pulse arriving a time t after the start of its record advances the phase by 2*pi*df*t per
+    frequency bin. Once t > 1/(2 df) (100 ps on a 5 GHz grid) that step exceeds pi, and any
+    bin-by-bin unwrap -- the instrument's export, or np.unwrap in the FFT path -- aliases it,
+    giving a phase difference with the wrong slope. Here the difference is re-wrapped, the delay
+    model removed, the slowly varying residual unwrapped, and the model added back:
+
+        phase_diff = 2*pi*f*tau + unwrap(wrap(phase_diff - 2*pi*f*tau))
+
+    This only changes the result by whole cycles per bin. The residual only has to change by less
+    than pi per bin, so dispersion and an error of up to about 1/(2 df) in tau are tolerated.
+
+    It is applied only when the input is actually aliased. Aliasing shifts the slope of the phase
+    difference by a multiple of 2*pi/df (1.26 rad/GHz on a 5 GHz grid), so the input is
+    re-unwrapped only if its slope over the `check` bins misses 2*pi*tau by more than half that
+    step. Correctly unwrapped data is returned unchanged. That matters for lossy samples, whose
+    noisy low-transmission bands would otherwise be unwrapped differently.
+
+    Returns (phase_diff, corrected).
+    """
+    out = np.array(phase_diff, dtype=float)
+    ok = np.isfinite(out)
+    chk = check & ok
+    if chk.sum() < 10:
+        return out, False
+    df_ghz = np.median(np.diff(freq))
+    slope = np.polyfit(freq[chk], out[chk], 1)[0]                 # rad/GHz
+    expected = 2 * np.pi * tau_ps * 1e-3                           # rad/GHz
+    if abs(slope - expected) <= np.pi / df_ghz:                    # within half an alias step: not aliased
+        return out, False
+    model = 2 * np.pi * freq[ok] * 1e9 * tau_ps * 1e-12
+    out[ok] = model + np.unwrap(np.angle(np.exp(1j * (out[ok] - model))))
+    return out, True
+
+def _resolve_fit_range(freq: np.ndarray, fit_range, usable: np.ndarray, min_points: int = 10):
+    """fit_range for the linear branch pick: as given, or, if None, (200, 500) GHz when the data
+    covers it, else the data's own usable band (e.g. TeraScan's ~90-180 GHz)."""
+    if fit_range is not None:
+        return tuple(fit_range)
+    default = (200.0, 500.0)
+    if np.sum(usable & (freq >= default[0]) & (freq <= default[1])) >= min_points:
+        return default
+    f = freq[usable]
+    if f.size < 2:
+        raise ValueError("No usable (finite, unmasked, f > 0) frequencies for the linear branch pick.")
+    return float(f.min()), float(f.max())
 
 def _detect_jump_candidates(
     f_good: np.ndarray,
@@ -559,7 +613,7 @@ def get_phase_diff(
     branch_method: Optional[Literal["pulse", "linear"]] = None,
     ambiguous_frac: float = 0.35,
     inconsistent_spread: float = 0.5,
-    fit_range: Tuple[float, float] = (200.0, 500.0),
+    fit_range: Optional[Tuple[float, float]] = None,
     max_branch_cycles: int = 10,
     jump_range: Tuple[float, Optional[float]] = (150.0, None),
     jump_height: float = 5.2,
@@ -590,7 +644,7 @@ def get_phase_diff(
 
        - 'pulse' (default whenever the instance has time-domain pulses, i.e.
          TeraFlash): measure the real delay `tau` between the sample and reference
-         pulses (|signal| peak of each, parabolically refined; see
+         pulses (abs(signal) peak of each, parabolically refined; see
          `_pulse_peak_time`). A delay tau accumulates phase 2*pi*f*tau, so the branch
          is the whole number of cycles between that prediction and the measured phase,
          taken as the power-weighted median over unmasked bins below `n_ulim` (all
@@ -610,6 +664,10 @@ def get_phase_diff(
          Before either step, the difference is oriented so that it follows the pulse
          delay (`_orient_by_delay`; normally a no-op, since both phase sources use the
          e^{+i w t} convention). That replaces the old `absolute=True` abs() workaround.
+         It is then unwrapped about the delay model 2*pi*f*tau rather than bin by bin
+         (`_reunwrap_about_delay`). A pulse arriving more than 1/(2 df) after the start of
+         its record (100 ps on a 5 GHz grid) advances the phase by more than pi per bin, which
+         any bin-by-bin unwrap aliases. `info['dealiased']` reports whether that happened.
        - 'linear' (fallback, and the only option without pulses, i.e. TeraScan): pick
          the multiple of 2*pi (within +-max_branch_cycles) that makes a straight-line
          fit over `fit_range` extrapolate closest to zero at f=0. This assumes the
@@ -704,8 +762,8 @@ def get_phase_diff(
 
     Parameters
     ----------
-    unwrap : bidirectionally double-unwrap (`np.unwrap(np.unwrap(theta) -
-        np.unwrap(theta_base))`) instead of a plain difference, for the rare case where
+    unwrap : bidirectionally double-unwrap,
+        ``np.unwrap(np.unwrap(theta) - np.unwrap(theta_base))``, instead of a plain difference, for the rare case where
         theta wraps faster than theta_base. Caller decides; nothing here inspects
         sample names.
     absolute : deprecated. On the 'pulse' path it is ignored (with a FutureWarning): the
@@ -720,7 +778,11 @@ def get_phase_diff(
         the instance has time-domain pulses (TeraFlash) and 'linear' otherwise
         (TeraScan). Passing 'pulse' explicitly on an instance without pulses raises.
         `fit_range` and `max_branch_cycles` only apply to 'linear'.
-    ambiguous_frac : |offset_frac| (cycles) above which a 'pulse' pick is flagged
+    fit_range : (lo, hi) GHz band for the 'linear' pick. None (default) uses (200, 500) when the
+        data covers it with at least 10 usable bins, and otherwise the data's own usable
+        (finite, unmasked) band. So TeraScan data (~90-180 GHz) works without an explicit
+        range; before, the default (200, 500) raised there.
+    ambiguous_frac : abs(offset_frac) (cycles) above which a 'pulse' pick is flagged
         `offset_ambiguous`. A wrong branch shifts the residual by a whole cycle, so a
         leftover near +-0.5 is exactly where two branches fit about equally well; 0.35
         leaves room for the <=0.2-cycle leftovers seen on clean samples.
@@ -788,6 +850,7 @@ def get_phase_diff(
         manual), 'offset_at_edge' (linear search only), 'jumps' (see
         _repair_phase_jumps), and for 'pulse': 'delay_ps', 'offset_frac',
         'offset_spread', 'offset_ambiguous', 'offset_inconsistent', 'offset_linear',
+        'orientation', 'orientation_coherence', 'dealiased',
         'branch_used_ulim' (False if too few bins lay below n_ulim and all unmasked
         bins were used), 'orientation' (+1, or -1 if the difference was flipped to follow
         the pulse delay) and 'orientation_coherence' (coherence as is, flipped).
@@ -850,8 +913,16 @@ def get_phase_diff(
                   f"{coh_minus:.2f} flipped vs {coh_plus:.2f} as is), i.e. the phases use the opposite "
                   f"sign convention; it has been flipped.")
 
+        # Unwrap about the delay model, so a pulse late in its record (> 1/(2 df) after the
+        # start) isn't aliased by bin-by-bin unwrapping.
+        phase_diff, dealiased = _reunwrap_about_delay(freq, phase_diff, tau_ps, orient_sel)
+        if dealiased and verbose:
+            print(f"{name}: phase difference was aliased by bin-by-bin unwrapping (pulse late in its "
+                  f"record); re-unwrapped about the pulse delay.")
+
         # Linear pick on the unrepaired phase, exactly as branch_method='linear' would make
         # it -- for comparison only.
+        fit_range = _resolve_fit_range(freq, fit_range, usable)
         offset_linear, intercept, _ = _pick_branch_offset(
             freq, phase_diff, fit_range, max_branch_cycles)
         at_edge = False
@@ -877,6 +948,7 @@ def get_phase_diff(
             'branch_used_ulim': bool(used_ulim),
             'orientation': int(orientation),
             'orientation_coherence': (coh_plus, coh_minus),
+            'dealiased': dealiased,
         }
         source = 'pulse'
         if verbose:
@@ -897,6 +969,10 @@ def get_phase_diff(
                   f"({offset / np.pi:.1f}*pi vs {offset_linear / np.pi:.1f}*pi); pulse is used.")
     else:
         if offset is None:
+            usable = np.isfinite(phase_diff) & (freq > 0)
+            if getattr(self, 'mask', None) is not None:
+                usable &= ~self.mask
+            fit_range = _resolve_fit_range(freq, fit_range, usable)
             offset, intercept, at_edge = _pick_branch_offset(
                 freq, phase_diff, fit_range, max_branch_cycles)
             source = 'linear'

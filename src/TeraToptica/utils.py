@@ -1,6 +1,7 @@
 # src/terapy/utils.py
 
 from __future__ import annotations
+import warnings
 from typing import Literal, Optional, Sequence, Tuple
 
 import numpy as np
@@ -203,11 +204,11 @@ def _pick_branch_offset_pulse(
 
     A pulse delayed by tau accumulates phase 2*pi*f*tau, so the branch is the whole
     number of cycles between that and the measured phase_diff. The per-bin residual
-    r(f) = (s*2*pi*f*tau - phase_diff) / 2*pi is summarized by its weighted median over
+    r(f) = (2*pi*f*tau - phase_diff) / 2*pi is summarized by its weighted median over
     `sel`, weighted by the spectral power that sets the pulse peak, and rounded.
 
-    The sign `s` follows the sign of the weighted phase slope, which does not depend on
-    the branch, so both the `absolute=True` and raw (signed) conventions work.
+    `phase_diff` must already be oriented so that a delayed sample has increasing phase
+    (see `_orient_by_delay`), which get_phase_diff does before calling this.
 
     Returns (offset, frac, spread): offset = 2*pi*k; frac = median - k is the part of a
     cycle the pulse and phase still disagree by (0 when group and phase delay match; near
@@ -218,9 +219,7 @@ def _pick_branch_offset_pulse(
     low-transmission dip) or strong dispersion -- which no single offset can fix.
     """
     f, p, w = freq[sel], phase_diff[sel], weights[sel]
-    slope = np.polyfit(f, p, 1, w=np.sqrt(w))[0]
-    s = 1.0 if slope >= 0 else -1.0
-    r = (s * 2 * np.pi * f * 1e9 * tau_ps * 1e-12 - p) / (2 * np.pi)
+    r = (2 * np.pi * f * 1e9 * tau_ps * 1e-12 - p) / (2 * np.pi)
 
     order = np.argsort(r)
     cw = np.cumsum(w[order]) / np.sum(w)
@@ -228,6 +227,38 @@ def _pick_branch_offset_pulse(
     r_med = quantile(0.5)
     k = int(np.round(r_med))
     return 2 * np.pi * k, r_med - k, quantile(0.75) - quantile(0.25)
+
+def _orient_by_delay(
+    freq: np.ndarray,
+    phase_diff: np.ndarray,
+    tau_ps: float,
+    weights: np.ndarray,
+    sel: np.ndarray,
+    min_margin: float = 0.2,
+):
+    """Sign (+1 or -1) that makes `phase_diff` follow the pulse delay: s * phase_diff ~ 2*pi*f*tau + const.
+
+    Both phase sources now use the e^{+i w t} convention (TF5 .spectr export, and FFT mode since
+    the sign fix in _spectr_from_pulse), so a delayed sample already has increasing phase and the
+    answer is normally +1. This is a safety net for data with the opposite convention (e.g. FFT
+    phases computed before that fix). It compares the power-weighted coherence
+    |sum w exp(i(s*phase_diff - 2*pi*f*tau))| for s = +1 and -1. Wrapping and 2*pi slips don't
+    change it, and a constant offset doesn't either, so it is independent of the branch. -1 is
+    returned only if its coherence beats +1's by `min_margin`. With a very small delay the two
+    orientations are hard to tell apart, and the instrument convention (+1) is kept.
+
+    Replaces the old `absolute=True` workaround, abs(theta - theta_base). That folded any part
+    of the phase difference that was negative, e.g. a small phase plus an arbitrary 2*pi offset
+    in the exported values, and mirrored thin low-index samples to n < 1 (HD30 foams).
+
+    Returns (s, coherence_plus, coherence_minus).
+    """
+    f, p, w = freq[sel], phase_diff[sel], weights[sel]
+    model = 2 * np.pi * f * 1e9 * tau_ps * 1e-12
+    coh = lambda s: float(np.abs(np.sum(w * np.exp(1j * (s * p - model)))) / np.sum(w))
+    c_plus, c_minus = coh(1.0), coh(-1.0)
+    s = -1.0 if c_minus > c_plus + min_margin else 1.0
+    return s, c_plus, c_minus
 
 def _detect_jump_candidates(
     f_good: np.ndarray,
@@ -576,6 +607,9 @@ def get_phase_diff(
          (step 2) runs BEFORE the branch pick, so mid-spectrum slips don't smear the
          residual; this reorder is exact because jump repair only uses phase
          differences and local line fits, which a constant offset cancels out of.
+         Before either step, the difference is oriented so that it follows the pulse
+         delay (`_orient_by_delay`; normally a no-op, since both phase sources use the
+         e^{+i w t} convention). That replaces the old `absolute=True` abs() workaround.
        - 'linear' (fallback, and the only option without pulses, i.e. TeraScan): pick
          the multiple of 2*pi (within +-max_branch_cycles) that makes a straight-line
          fit over `fit_range` extrapolate closest to zero at f=0. This assumes the
@@ -674,8 +708,12 @@ def get_phase_diff(
         np.unwrap(theta_base))`) instead of a plain difference, for the rare case where
         theta wraps faster than theta_base. Caller decides; nothing here inspects
         sample names.
-    absolute : take `abs()` of the difference before branch-picking. Ignored if
-        `unwrap=True` (matches this codebase's existing conventions either way).
+    absolute : deprecated. On the 'pulse' path it is ignored (with a FutureWarning): the
+        difference is oriented by the measured pulse delay instead (see `_orient_by_delay`).
+        `abs()` folded any negative part of the difference, e.g. a small phase plus an
+        arbitrary 2*pi offset in the exported values, and mirrored thin low-index samples to
+        n < 1. On the 'linear'/manual paths (TeraScan) it still takes `abs()` of the plain
+        difference. Ignored if `unwrap=True`.
     offset : pin a branch (radians, e.g. `4*np.pi`) you've independently verified,
         skipping the auto search in step 1 entirely.
     branch_method : 'pulse' or 'linear' (see step 1). None (default) picks 'pulse' when
@@ -751,7 +789,8 @@ def get_phase_diff(
         _repair_phase_jumps), and for 'pulse': 'delay_ps', 'offset_frac',
         'offset_spread', 'offset_ambiguous', 'offset_inconsistent', 'offset_linear',
         'branch_used_ulim' (False if too few bins lay below n_ulim and all unmasked
-        bins were used).
+        bins were used), 'orientation' (+1, or -1 if the difference was flipped to follow
+        the pulse delay) and 'orientation_coherence' (coherence as is, flipped).
 
     Returns
     -------
@@ -760,13 +799,6 @@ def get_phase_diff(
     should be trusted. Never modifies `theta`/`theta_base`.
     """
     freq, theta, theta_base = self.base_freq, self.samp_phase, self.base_phase
-
-    if unwrap:
-        phase_diff = np.unwrap(np.unwrap(theta) - np.unwrap(theta_base))
-    else:
-        phase_diff = np.asarray(theta, dtype=float) - np.asarray(theta_base, dtype=float)
-        if absolute:
-            phase_diff = np.abs(phase_diff)
 
     name = label if label is not None else self.samp
     has_pulses = hasattr(self, 'samp_signal') and hasattr(self, 'base_signal')
@@ -777,6 +809,19 @@ def get_phase_diff(
     if branch_method == 'pulse' and not has_pulses:
         raise ValueError(f"{name}: branch_method='pulse' needs time-domain pulses, which this "
                          f"instance doesn't have (e.g. TeraScan); use branch_method='linear'.")
+    use_pulse = offset is None and branch_method == 'pulse'
+
+    if unwrap:
+        phase_diff = np.unwrap(np.unwrap(theta) - np.unwrap(theta_base))
+    else:
+        phase_diff = np.asarray(theta, dtype=float) - np.asarray(theta_base, dtype=float)
+        if absolute and not use_pulse:
+            phase_diff = np.abs(phase_diff)
+    if absolute and use_pulse:
+        warnings.warn("get_phase_diff(absolute=True) is no longer needed and is ignored on the pulse "
+                      "branch path: the phase difference is oriented by the measured pulse delay instead "
+                      "of abs(), which folded small or offset phases (n < 1 on thin foams). Drop the argument.",
+                      FutureWarning, stacklevel=2)
 
     def repair(pd):
         return _repair_phase_jumps(
@@ -785,7 +830,26 @@ def get_phase_diff(
             slope_window_ghz, max_smear_bins, max_jump_cycles)
 
     pulse_info = {}
-    if offset is None and branch_method == 'pulse':
+    if use_pulse:
+        tau_ps = _pulse_delay_ps(self.samp_time, self.samp_signal, self.base_time, self.base_signal)
+        weights = np.abs(np.asarray(self.samp_amp, dtype=float)) * np.abs(np.asarray(self.base_amp, dtype=float))
+        mask = getattr(self, 'mask', None)
+        usable = np.isfinite(phase_diff) & (freq > 0) & (weights > 0)
+        if mask is not None:
+            usable &= ~mask
+
+        # Orient by the pulse delay (replaces the old abs() workaround), before anything else
+        # so jump steps and the linear comparison pick are reported in the final convention.
+        orient_sel = usable & (freq <= 1500.0)
+        if orient_sel.sum() < 20:
+            orient_sel = usable
+        orientation, coh_plus, coh_minus = _orient_by_delay(freq, phase_diff, tau_ps, weights, orient_sel)
+        phase_diff = orientation * phase_diff  # new array: never aliases theta/theta_base
+        if orientation < 0:
+            print(f"Warning: {name}: the phase difference runs opposite to the pulse delay (coherence "
+                  f"{coh_minus:.2f} flipped vs {coh_plus:.2f} as is), i.e. the phases use the opposite "
+                  f"sign convention; it has been flipped.")
+
         # Linear pick on the unrepaired phase, exactly as branch_method='linear' would make
         # it -- for comparison only.
         offset_linear, intercept, _ = _pick_branch_offset(
@@ -793,15 +857,8 @@ def get_phase_diff(
         at_edge = False
 
         # Jump repair first (a constant offset cancels out of it), then the branch pick.
-        phase_diff = phase_diff.copy()  # never aliases theta/theta_base
         n_ulim, jumps = repair(phase_diff)
 
-        tau_ps = _pulse_delay_ps(self.samp_time, self.samp_signal, self.base_time, self.base_signal)
-        weights = np.abs(np.asarray(self.samp_amp, dtype=float)) * np.abs(np.asarray(self.base_amp, dtype=float))
-        mask = getattr(self, 'mask', None)
-        usable = np.isfinite(phase_diff) & (freq > 0) & (weights > 0)
-        if mask is not None:
-            usable &= ~mask
         sel = usable & (freq < n_ulim)
         used_ulim = sel.sum() >= 20
         if not used_ulim:
@@ -818,6 +875,8 @@ def get_phase_diff(
             'offset_inconsistent': inconsistent,
             'offset_linear': float(offset_linear),
             'branch_used_ulim': bool(used_ulim),
+            'orientation': int(orientation),
+            'orientation_coherence': (coh_plus, coh_minus),
         }
         source = 'pulse'
         if verbose:

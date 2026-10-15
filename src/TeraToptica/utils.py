@@ -165,6 +165,70 @@ def _pick_branch_offset(
     i = int(np.argmin(np.abs(intercept + offsets)))
     return offsets[i], float(intercept), i in (0, len(offsets) - 1)
 
+def _pulse_peak_time(t: np.ndarray, s: np.ndarray) -> float:
+    """Time (ps) of a pulse's |signal| peak, refined with a 3-point parabolic fit.
+
+    The median baseline is removed first so a DC offset can't move the peak. |signal|
+    rather than the Hilbert envelope or a cross-correlation: on lossy, reshaped pulses
+    (mm-thick meteorite slabs) the envelope drifted ~0.5 ps and cross-correlation locked
+    onto the wrong lobe (off by ~3 ps), while the |signal| peak matched the phase-derived
+    index to within ~0.01 in n.
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.abs(np.asarray(s, dtype=float) - np.median(s))
+    i = int(np.argmax(y))
+    if 0 < i < len(y) - 1:
+        y0, y1, y2 = y[i - 1:i + 2]
+        denom = y0 - 2 * y1 + y2
+        d = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
+        return float(t[i] + d * (t[i + 1] - t[i - 1]) / 2)
+    return float(t[i])
+
+def _pulse_delay_ps(t_s: np.ndarray, s_s: np.ndarray, t_b: np.ndarray, s_b: np.ndarray) -> float:
+    """Sample-minus-reference pulse delay (ps) from the |signal| peak of each pulse.
+
+    Uses each file's absolute time axis, so a reference recorded in its own file (or with
+    a different time window) is handled the same as a reference_included layout.
+    """
+    return _pulse_peak_time(t_s, s_s) - _pulse_peak_time(t_b, s_b)
+
+def _pick_branch_offset_pulse(
+    freq: np.ndarray,
+    phase_diff: np.ndarray,
+    tau_ps: float,
+    weights: np.ndarray,
+    sel: np.ndarray,
+):
+    """Pulse-delay 2*pi branch pick. See get_phase_diff for the rationale.
+
+    A pulse delayed by tau accumulates phase 2*pi*f*tau, so the branch is the whole
+    number of cycles between that and the measured phase_diff. The per-bin residual
+    r(f) = (s*2*pi*f*tau - phase_diff) / 2*pi is summarized by its weighted median over
+    `sel`, weighted by the spectral power that sets the pulse peak, and rounded.
+
+    The sign `s` follows the sign of the weighted phase slope, which does not depend on
+    the branch, so both the `absolute=True` and raw (signed) conventions work.
+
+    Returns (offset, frac, spread): offset = 2*pi*k; frac = median - k is the part of a
+    cycle the pulse and phase still disagree by (0 when group and phase delay match; near
+    +-0.5 means the adjacent branch fits about equally well); spread is the weighted
+    interquartile range of the residual in cycles. A flat residual (spread << 1) means one
+    offset fits the whole selected band; a spread of a cycle or more means the phase
+    itself is inconsistent across the band -- an unrepaired 2*pi slip (e.g. through a
+    low-transmission dip) or strong dispersion -- which no single offset can fix.
+    """
+    f, p, w = freq[sel], phase_diff[sel], weights[sel]
+    slope = np.polyfit(f, p, 1, w=np.sqrt(w))[0]
+    s = 1.0 if slope >= 0 else -1.0
+    r = (s * 2 * np.pi * f * 1e9 * tau_ps * 1e-12 - p) / (2 * np.pi)
+
+    order = np.argsort(r)
+    cw = np.cumsum(w[order]) / np.sum(w)
+    quantile = lambda q: float(r[order][min(np.searchsorted(cw, q), len(r) - 1)])
+    r_med = quantile(0.5)
+    k = int(np.round(r_med))
+    return 2 * np.pi * k, r_med - k, quantile(0.75) - quantile(0.25)
+
 def _detect_jump_candidates(
     f_good: np.ndarray,
     phase_good: np.ndarray,
@@ -461,6 +525,9 @@ def get_phase_diff(
     unwrap: bool = False,
     absolute: bool = False,
     offset: Optional[float] = None,
+    branch_method: Optional[Literal["pulse", "linear"]] = None,
+    ambiguous_frac: float = 0.35,
+    inconsistent_spread: float = 0.5,
     fit_range: Tuple[float, float] = (200.0, 500.0),
     max_branch_cycles: int = 10,
     jump_range: Tuple[float, Optional[float]] = (150.0, None),
@@ -488,9 +555,37 @@ def get_phase_diff(
     Two independent steps:
 
     1. Branch pick: `theta - theta_base` is only known up to a whole number of extra
-       2*pi cycles (the "branch"). Pick the multiple of 2*pi (within
-       +-max_branch_cycles) that makes a straight-line fit over `fit_range` extrapolate
-       closest to zero at f=0 therefore calibrates the phase information.
+       2*pi cycles (the "branch"). Two methods (`branch_method`):
+
+       - 'pulse' (default whenever the instance has time-domain pulses, i.e.
+         TeraFlash): measure the real delay `tau` between the sample and reference
+         pulses (|signal| peak of each, parabolically refined; see
+         `_pulse_peak_time`). A delay tau accumulates phase 2*pi*f*tau, so the branch
+         is the whole number of cycles between that prediction and the measured phase,
+         taken as the power-weighted median over unmasked bins below `n_ulim` (all
+         unmasked bins if fewer than 20 remain) and rounded. Nothing here decides which
+         band of the phase to trust or extrapolates to f=0 -- the delay is measured
+         directly. Its one assumption is that the pulse (group) delay equals the phase
+         delay, i.e. weak dispersion (n_group ~ n_phase). How well that held is reported
+         as `offset_frac`: the fraction of a cycle left over after rounding. Near 0 is
+         clean (HDPE and foams: <=0.12); beyond `ambiguous_frac` the neighboring branch
+         fits nearly as well, and the pick is flagged `offset_ambiguous` (with a printed
+         warning, like `offset_inconsistent` below) rather than silently trusted. A
+         second diagnostic, `offset_spread`, checks that one branch fits the whole band
+         (see `inconsistent_spread`). On this path the jump repair
+         (step 2) runs BEFORE the branch pick, so mid-spectrum slips don't smear the
+         residual; this reorder is exact because jump repair only uses phase
+         differences and local line fits, which a constant offset cancels out of.
+       - 'linear' (fallback, and the only option without pulses, i.e. TeraScan): pick
+         the multiple of 2*pi (within +-max_branch_cycles) that makes a straight-line
+         fit over `fit_range` extrapolate closest to zero at f=0. This assumes the
+         phase in `fit_range` is trustworthy and extrapolates linearly to f=0, which
+         fails on lossy samples whose low-frequency phase is noisy (NWA L5 meteorite:
+         n off by up to 0.8 between rotations of one slab, where 'pulse' agrees).
+         Behavior is unchanged from before 'pulse' existed.
+
+       Whenever 'pulse' is used, the 'linear' pick is also computed for comparison
+       (`offset_linear`), and verbose=True prints a note when the two disagree.
     2. Jump repair: a detrended, multi-bin-aware detector (`_detect_jump_candidates`)
        finds mid-spectrum 2*pi slips within `jump_range`, then reconciles each with a
        -2*pi/0/+2*pi step using LOCAL line fits on either side (excluding
@@ -583,6 +678,20 @@ def get_phase_diff(
         `unwrap=True` (matches this codebase's existing conventions either way).
     offset : pin a branch (radians, e.g. `4*np.pi`) you've independently verified,
         skipping the auto search in step 1 entirely.
+    branch_method : 'pulse' or 'linear' (see step 1). None (default) picks 'pulse' when
+        the instance has time-domain pulses (TeraFlash) and 'linear' otherwise
+        (TeraScan). Passing 'pulse' explicitly on an instance without pulses raises.
+        `fit_range` and `max_branch_cycles` only apply to 'linear'.
+    ambiguous_frac : |offset_frac| (cycles) above which a 'pulse' pick is flagged
+        `offset_ambiguous`. A wrong branch shifts the residual by a whole cycle, so a
+        leftover near +-0.5 is exactly where two branches fit about equally well; 0.35
+        leaves room for the <=0.2-cycle leftovers seen on clean samples.
+    inconsistent_spread : weighted interquartile range (cycles) of the pulse residual
+        above which a 'pulse' pick is flagged `offset_inconsistent`. A flat residual means
+        one branch fits the whole band (HDPE, foams: ~0.01-0.06). A spread near a whole
+        cycle means the phase itself jumps somewhere in the band -- seen on NWA L5, whose
+        phase slips 1-2 cycles through the ~250-300 GHz transmission dip without
+        tripping jump repair -- so no single offset is right everywhere.
     boundary_height : rad; low, sensitive threshold used only to keep each candidate
         jump's before/after fit windows local (see the long note above) -- distinct
         from `jump_height`, which decides whether a break is actionable at all. Should
@@ -636,8 +745,13 @@ def get_phase_diff(
         the same format this logic has printed in past notebook implementations.
     label : name used in printed messages (verbose=True only); defaults to this
         instance's sample stem (`self.samp`) if not given.
-    return_info : if True, also return a dict with 'offset', 'offset_source' ('auto' or
-        'manual'), 'intercept', 'offset_at_edge', and 'jumps' (see _repair_phase_jumps).
+    return_info : if True, also return a dict with 'offset', 'offset_source' ('pulse',
+        'linear' or 'manual'), 'intercept' (linear fit's f=0 intercept, or None for
+        manual), 'offset_at_edge' (linear search only), 'jumps' (see
+        _repair_phase_jumps), and for 'pulse': 'delay_ps', 'offset_frac',
+        'offset_spread', 'offset_ambiguous', 'offset_inconsistent', 'offset_linear',
+        'branch_used_ulim' (False if too few bins lay below n_ulim and all unmasked
+        bins were used).
 
     Returns
     -------
@@ -655,25 +769,91 @@ def get_phase_diff(
             phase_diff = np.abs(phase_diff)
 
     name = label if label is not None else self.samp
-    if offset is None:
-        offset, intercept, at_edge = _pick_branch_offset(
-            freq, phase_diff, fit_range, max_branch_cycles)
-        if at_edge:
-            print(f"Warning: {name}: branch offset {offset / np.pi:.1f}*pi is at the edge of the "
-                  f"+-{max_branch_cycles}-cycle search; increase max_branch_cycles to check whether "
-                  f"a further branch fits better.")
-        if verbose:
-            print(f"{name}: branch offset = {offset / np.pi:.1f}*pi (auto, intercept={intercept:.1f})")
-    else:
-        intercept, at_edge = None, False
-        if verbose:
-            print(f"{name}: branch offset = {offset / np.pi:.1f}*pi (manual)")
-    phase_diff = phase_diff + offset  # new array: never aliases theta/theta_base
+    has_pulses = hasattr(self, 'samp_signal') and hasattr(self, 'base_signal')
+    if branch_method is None:
+        branch_method = 'pulse' if has_pulses else 'linear'
+    if branch_method not in ('pulse', 'linear'):
+        raise ValueError(f"branch_method must be 'pulse', 'linear' or None, got {branch_method!r}")
+    if branch_method == 'pulse' and not has_pulses:
+        raise ValueError(f"{name}: branch_method='pulse' needs time-domain pulses, which this "
+                         f"instance doesn't have (e.g. TeraScan); use branch_method='linear'.")
 
-    n_ulim, jumps = _repair_phase_jumps(
-        freq, phase_diff, jump_range, jump_height, jump_distance,
-        jump_exclusion_ghz, residual_threshold, default_n_ulim, boundary_height,
-        slope_window_ghz, max_smear_bins, max_jump_cycles)
+    def repair(pd):
+        return _repair_phase_jumps(
+            freq, pd, jump_range, jump_height, jump_distance,
+            jump_exclusion_ghz, residual_threshold, default_n_ulim, boundary_height,
+            slope_window_ghz, max_smear_bins, max_jump_cycles)
+
+    pulse_info = {}
+    if offset is None and branch_method == 'pulse':
+        # Linear pick on the unrepaired phase, exactly as branch_method='linear' would make
+        # it -- for comparison only.
+        offset_linear, intercept, _ = _pick_branch_offset(
+            freq, phase_diff, fit_range, max_branch_cycles)
+        at_edge = False
+
+        # Jump repair first (a constant offset cancels out of it), then the branch pick.
+        phase_diff = phase_diff.copy()  # never aliases theta/theta_base
+        n_ulim, jumps = repair(phase_diff)
+
+        tau_ps = _pulse_delay_ps(self.samp_time, self.samp_signal, self.base_time, self.base_signal)
+        weights = np.abs(np.asarray(self.samp_amp, dtype=float)) * np.abs(np.asarray(self.base_amp, dtype=float))
+        mask = getattr(self, 'mask', None)
+        usable = np.isfinite(phase_diff) & (freq > 0) & (weights > 0)
+        if mask is not None:
+            usable &= ~mask
+        sel = usable & (freq < n_ulim)
+        used_ulim = sel.sum() >= 20
+        if not used_ulim:
+            sel = usable
+        offset, frac, spread = _pick_branch_offset_pulse(freq, phase_diff, tau_ps, weights, sel)
+        ambiguous = abs(frac) > ambiguous_frac
+        inconsistent = spread > inconsistent_spread
+        phase_diff += offset
+        pulse_info = {
+            'delay_ps': tau_ps,
+            'offset_frac': frac,
+            'offset_spread': spread,
+            'offset_ambiguous': ambiguous,
+            'offset_inconsistent': inconsistent,
+            'offset_linear': float(offset_linear),
+            'branch_used_ulim': bool(used_ulim),
+        }
+        source = 'pulse'
+        if verbose:
+            print(f"{name}: branch offset = {offset / np.pi:.1f}*pi (pulse, delay={tau_ps:.2f} ps, "
+                  f"residual={frac:+.2f} cycles, spread={spread:.2f} cycles; "
+                  f"linear would pick {offset_linear / np.pi:.1f}*pi)")
+        if inconsistent:
+            print(f"Warning: {name}: the pulse-predicted phase fits different parts of the spectrum "
+                  f"with different branches (residual spread {spread:.2f} cycles), i.e. the phase has "
+                  f"an unrepaired 2*pi slip or strong dispersion. The branch matches the phase where "
+                  f"the pulse's power is concentrated; n elsewhere may be off by whole cycles.")
+        if ambiguous:
+            print(f"Warning: {name}: pulse branch pick is ambiguous -- the pulse delay and the phase "
+                  f"disagree by {frac:+.2f} cycles, so the neighboring branch fits nearly as well. "
+                  f"Check n against other measurements, or pin offset=.")
+        elif verbose and offset != offset_linear:
+            print(f"{name}: note: pulse and linear branch picks disagree "
+                  f"({offset / np.pi:.1f}*pi vs {offset_linear / np.pi:.1f}*pi); pulse is used.")
+    else:
+        if offset is None:
+            offset, intercept, at_edge = _pick_branch_offset(
+                freq, phase_diff, fit_range, max_branch_cycles)
+            source = 'linear'
+            if at_edge:
+                print(f"Warning: {name}: branch offset {offset / np.pi:.1f}*pi is at the edge of the "
+                      f"+-{max_branch_cycles}-cycle search; increase max_branch_cycles to check whether "
+                      f"a further branch fits better.")
+            if verbose:
+                print(f"{name}: branch offset = {offset / np.pi:.1f}*pi (linear, intercept={intercept:.1f})")
+        else:
+            intercept, at_edge = None, False
+            source = 'manual'
+            if verbose:
+                print(f"{name}: branch offset = {offset / np.pi:.1f}*pi (manual)")
+        phase_diff = phase_diff + offset  # new array: never aliases theta/theta_base
+        n_ulim, jumps = repair(phase_diff)
 
     if verbose:
         for j in jumps:
@@ -692,10 +872,11 @@ def get_phase_diff(
     if return_info:
         info = {
             'offset': float(offset),
-            'offset_source': 'manual' if intercept is None else 'auto',
+            'offset_source': source,
             'intercept': intercept,
             'offset_at_edge': at_edge,
             'jumps': jumps,
+            **pulse_info,
         }
         return phase_diff, n_ulim, info
     return phase_diff, n_ulim

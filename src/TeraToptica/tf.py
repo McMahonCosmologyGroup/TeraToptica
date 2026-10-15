@@ -700,6 +700,14 @@ class TeraFlashAnalyzer:
     def get_sample_pulse(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.samp_time, self.samp_signal
 
+    def get_pulse_delay(self) -> float:
+        """Sample-minus-reference pulse delay in ps (|signal| peaks, parabolically refined).
+
+        This is the delay get_phase_diff's default 'pulse' branch pick uses. For a sample
+        of thickness w, the group index is n_g = 1 + c * delay / w.
+        """
+        return _utils._pulse_delay_ps(self.samp_time, self.samp_signal, self.base_time, self.base_signal)
+
     def get_phases(self):
         return self.samp_phase, self.base_phase
 

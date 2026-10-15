@@ -26,3 +26,6 @@ env/
 # Misc
 *.log
 .DS_Store
+
+# Docs build output
+docs/_build/

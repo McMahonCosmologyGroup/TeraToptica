@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "TeraToptica"
+version = "0.1.0"
+description = "Reflection and transmission analysis for Toptica TeraFlash and TeraScan THz spectrometer data"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Alex Thomas", email = "agthomas@uchicago.edu" }]
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "matplotlib", "astropy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+docs = ["sphinx>=7", "furo", "myst-parser"]
+
+[project.urls]
+Repository = "https://github.com/McMahonCosmologyGroup/TeraToptica"
+Documentation = "https://teratoptica.readthedocs.io"
+Changelog = "https://github.com/McMahonCosmologyGroup/TeraToptica/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

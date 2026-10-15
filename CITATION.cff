@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use TeraToptica in a publication, please cite it as below."
+title: "TeraToptica"
+abstract: "Reflection and transmission analysis for Toptica TeraFlash and TeraScan THz spectrometer data."
+type: software
+authors:
+  - family-names: "Thomas"
+    given-names: "Alex"
+    email: "agthomas@uchicago.edu"
+    affiliation: "University of Chicago"
+version: "0.1.0"
+date-released: "2026-10-15"
+doi: "10.5281/zenodo.18438202"
+license: MIT
+repository-code: "https://github.com/McMahonCosmologyGroup/TeraToptica"

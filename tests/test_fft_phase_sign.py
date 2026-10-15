@@ -1,6 +1,6 @@
 """
 Regression test for the FFT-mode phase sign (TeraFlashAnalyzer._spectr_from_pulse in
-src/TeraToptica/tf.py). Plain-assert script (no pytest dependency) --
+src/TeraToptica/tf.py). Runs under pytest, or standalone --
 run with: python tests/test_fft_phase_sign.py
 
 Bug: numpy's rfft follows the e^{-i w t} convention, so the FFT-mode phase of a pulse at time t0
@@ -29,7 +29,7 @@ def phase_slope_ps(freq, phase, lo=200.0, hi=500.0):
     return np.polyfit(freq[sel], phase[sel], 1)[0] / (2 * np.pi) * 1e3
 
 
-def main():
+def test_fft_phase_sign_matches_spectr_convention():
     t = np.arange(0.0, 200.0 + 1e-9, 0.05)  # ps, like a 200 ps TeraFlash record
     t_ref, delay = 27.0, 0.40                # reference peak position and a sample delay (ps)
 
@@ -47,4 +47,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test_fft_phase_sign_matches_spectr_convention()

@@ -1,6 +1,6 @@
 """
 Regression test for the orientation of the phase difference in get_phase_diff
-(src/TeraToptica/utils.py). Plain-assert script (no pytest dependency) --
+(src/TeraToptica/utils.py). Runs under pytest, or standalone --
 run with: python tests/test_phase_orientation.py
 
 Bug: get_phase_diff(absolute=True) took abs(theta - theta_base). The exported phases carry
@@ -56,7 +56,7 @@ def n_from(obj, w_m, **kw):
     return n, info
 
 
-def main():
+def test_phase_orientation():
     w = 3.0e-3                      # 3 mm slab
     n_true = 1.10                   # delay (n - 1) w / c = 1.0 ps
     delay = (n_true - 1) * w / C * 1e12
@@ -99,4 +99,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test_phase_orientation()

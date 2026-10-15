@@ -1,6 +1,6 @@
 """
 Regression test for the window_size_ghz unit mismatch fix in convolve_1d
-(src/TeraToptica/utils.py). Plain-assert script (no pytest dependency) --
+(src/TeraToptica/utils.py). Runs under pytest, or standalone --
 run with: python tests/test_smoothing.py
 
 Bug: Gaussian1DKernel's constructor parameter is a standard deviation, not
@@ -32,7 +32,7 @@ def half_max_width(x, y):
     return above.max() - above.min()
 
 
-def main():
+def test_gaussian_and_boxcar_widths_comparable():
     # Synthetic step: a sharp transition from 1 -> 0, like an idealized filter cutoff.
     freq = np.arange(0.0, 500.0, 1.0)  # 1 GHz spacing, matching this repo's TeraFlash convention
     step = np.where(freq < 250.0, 1.0, 0.0).astype(float)
@@ -74,4 +74,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test_gaussian_and_boxcar_widths_comparable()

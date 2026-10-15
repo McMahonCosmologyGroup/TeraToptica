@@ -145,7 +145,7 @@ good = f < n_ulim
 
 ## Changes that affect results
 
-The full list, by version, is in [CHANGELOG.md](CHANGELOG.md). Re-reduce data products made with older
+The full list, by version, is in [CHANGELOG.md](https://github.com/McMahonCosmologyGroup/TeraToptica/blob/main/CHANGELOG.md). Re-reduce data products made with older
 versions if these changes matter to them. These are the changes in 0.1.0:
 
 | Commit | Date | Change |
